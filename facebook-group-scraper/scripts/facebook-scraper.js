@@ -14,6 +14,7 @@ class FacebookScraper {
     this.observer = null; // For intersection observer
     this.sentinelElement = null;
     this.debugMode = true; // Enable for console logs
+    this.cleanupInterval = null;
   }
 
   /**
@@ -187,8 +188,33 @@ class FacebookScraper {
     this.log(`Waiting ${timeout}ms for content to load`);
     const startTime = Date.now();
 
+    // Thêm phát hiện chặn scraping
+    const oldHeight = document.documentElement.scrollHeight;
+
     // Wait for content to load
     await new Promise((resolve) => setTimeout(resolve, timeout));
+
+    // Kiểm tra nếu không có nội dung mới được tải
+    const newHeight = document.documentElement.scrollHeight;
+    if (
+      oldHeight === newHeight &&
+      this.lastScrapedCount === this.scrapedPosts.length
+    ) {
+      this.consecutiveNoNewContentCount =
+        (this.consecutiveNoNewContentCount || 0) + 1;
+
+      if (this.consecutiveNoNewContentCount >= 3) {
+        console.warn(
+          'Có thể Facebook đang chặn việc scraping - không có nội dung mới được tải sau 3 lần'
+        );
+        // Có thể tạm dừng hoặc giảm tốc độ scraping
+        await new Promise((resolve) => setTimeout(resolve, 5000)); // Đợi thêm
+      }
+    } else {
+      this.consecutiveNoNewContentCount = 0;
+    }
+
+    this.lastScrapedCount = this.scrapedPosts.length;
 
     // Process new posts if not paused
     if (!this.isPaused) {
@@ -218,56 +244,101 @@ class FacebookScraper {
   }
 
   /**
-   * Extract post ID for duplicate detection
+   * Extract post ID with more reliable methods
    */
   extractPostId(postElement) {
     try {
-      // Debug log the element
-      if (this.debugMode) {
-        console.log('Attempting to extract ID from:', postElement);
-      }
+      // Method 1: From Facebook's own post ID in the data attributes
+      let postId = null;
 
-      // Try multiple ways to get post ID
-
-      // Method 1: From data attributes
-      let postId = postElement.getAttribute('data-ft');
-      if (postId) {
+      // Try data-ft attribute first (most reliable)
+      const dataFt = postElement.getAttribute('data-ft');
+      if (dataFt) {
         try {
-          const dataFt = JSON.parse(postId);
-          if (dataFt.top_level_post_id) {
-            return dataFt.top_level_post_id;
+          const parsed = JSON.parse(dataFt);
+          if (parsed.top_level_post_id) {
+            return parsed.top_level_post_id;
+          } else if (parsed.content_owner_id_new) {
+            return parsed.content_owner_id_new;
           }
         } catch (e) {
-          // Failed to parse JSON, continue to other methods
+          // Continue to other methods
         }
       }
 
-      // Method 2: From post_id in HTML - use a more forgiving regex
-      const htmlContent = postElement.innerHTML;
-      const postIdRegexes = [
-        /"post_id":"(\d+)"/,
-        /"post_id":(\d+)/,
-        /\/posts\/(\d+)/,
-        /\/permalink\/(\d+)/,
-        /&id=(\d+)/
+      // Method 2: From post permalinks
+      const permalinkSelectors = [
+        'a[href*="/permalink/"]',
+        'a[href*="/posts/"]',
+        'a[href*="story_fbid="]'
       ];
 
-      for (const regex of postIdRegexes) {
-        const match = htmlContent.match(regex);
-        if (match && match[1]) {
-          return match[1];
+      for (const selector of permalinkSelectors) {
+        const link = postElement.querySelector(selector);
+        if (link && link.href) {
+          // Try /permalink/ID/ pattern
+          let match = link.href.match(/\/permalink\/(\d+)/);
+          if (match && match[1]) return match[1];
+
+          // Try /posts/ID/ pattern
+          match = link.href.match(/\/posts\/(\d+)/);
+          if (match && match[1]) return match[1];
+
+          // Try story_fbid=ID pattern
+          match = link.href.match(/story_fbid=(\d+)/);
+          if (match && match[1]) return match[1];
         }
       }
 
-      // Method 3: Generate unique ID using timestamp and random string
+      // Method 3: Content-based fingerprint as last resort
+      // Create a "fingerprint" based on content to identify duplicates
+      const contentFingerprint = this.createContentFingerprint(postElement);
+      if (contentFingerprint) {
+        return `content_${contentFingerprint}`;
+      }
+
       return `generated_${Date.now()}_${Math.random()
         .toString(36)
         .substring(2, 10)}`;
-    } catch (e) {
-      console.error('Error extracting post ID:', e);
-      return `error_${Date.now()}_${Math.random()
+    } catch (error) {
+      console.error('Error extracting post ID:', error);
+      return `generated_${Date.now()}_${Math.random()
         .toString(36)
         .substring(2, 10)}`;
+    }
+  }
+
+  /**
+   * Create a content fingerprint for duplicate detection
+   */
+  createContentFingerprint(postElement) {
+    try {
+      // Get text content of the post, limited to first 100 chars for efficiency
+      const text = postElement.textContent.slice(0, 100).trim();
+
+      // Get author name if possible
+      let authorName = '';
+      const authorEl = postElement.querySelector(
+        'h3 a, h4 a, a[role="link"][tabindex="0"]'
+      );
+      if (authorEl) {
+        authorName = authorEl.textContent.trim();
+      }
+
+      // Create a composite string to hash
+      const compositeString = `${authorName}_${text}`;
+
+      // Use a simple hash function
+      let hash = 0;
+      for (let i = 0; i < compositeString.length; i++) {
+        const char = compositeString.charCodeAt(i);
+        hash = (hash << 5) - hash + char;
+        hash = hash & hash; // Convert to 32bit integer
+      }
+
+      return Math.abs(hash).toString(16);
+    } catch (e) {
+      return null;
     }
   }
 
@@ -276,7 +347,7 @@ class FacebookScraper {
    */
   hashString(str) {
     let hash = 0;
-    for (let i = 0; i < str.length; i++) {
+    for (let i = 0; str.length; i++) {
       const char = str.charCodeAt(i);
       hash = (hash << 5) - hash + char;
       hash = hash & hash; // Convert to 32bit integer
@@ -291,86 +362,31 @@ class FacebookScraper {
     if (!postElement) return null;
 
     try {
-      console.log('Đang xử lý bài viết:', {
-        role: postElement.getAttribute('role'),
-        class: postElement.className,
-        height: postElement.offsetHeight
-      });
+      console.log('Đang xử lý bài viết với phương pháp mạnh hơn!');
 
-      // Expand all "See more" buttons
-      const buttons = postElement.querySelectorAll('[role="button"]');
-      for (const button of buttons) {
-        if (
-          button.textContent.includes('See more') ||
-          button.textContent.includes('Xem thêm')
-        ) {
-          try {
-            button.click();
-            await new Promise((resolve) => setTimeout(resolve, 300));
-          } catch (e) {
-            console.warn('Lỗi khi nhấn nút xem thêm:', e);
-          }
-        }
-      }
-
-      // Lấy ID của bài viết
+      // 1. Lấy ID của bài viết trước
       const postId =
         this.extractPostId(postElement) || `generated_${Date.now()}`;
 
-      // THAY ĐỔI: Sử dụng cách tiếp cận khác để lấy nội dung
-      let postText = '';
+      // 2. Sử dụng phương pháp kết hợp mạnh nhất để lấy nội dung
+      const postText = await this.extractAllContent(postElement);
 
-      // 1. Thử lấy văn bản từ article
-      const contentContainers = [
-        ...postElement.querySelectorAll('div[dir="auto"]'),
-        ...postElement.querySelectorAll('[data-ad-comet-preview="message"]'),
-        ...postElement.querySelectorAll('span.x193iq5w'),
-        ...postElement.querySelectorAll('div.xdj266r')
-      ];
+      console.log(
+        `Đã trích xuất ${postText ? postText.length : 0} ký tự nội dung`
+      );
 
-      // 2. Lọc và kết hợp nội dung
-      const paragraphs = new Set();
-
-      for (const container of contentContainers) {
-        const text = container.textContent.trim();
-
-        // Bỏ qua nút, metadata và các phần tử ngắn
-        if (
-          text &&
-          text.length > 15 &&
-          !text.includes('See more') &&
-          !text.includes('Xem thêm') &&
-          !text.includes('Like') &&
-          !text.includes('Comment') &&
-          !text.includes('Share') &&
-          !text.includes('Thích') &&
-          !text.includes('Bình luận') &&
-          !text.includes('Chia sẻ') &&
-          !text.includes('ago') &&
-          !text.includes('phút') &&
-          !text.includes('giờ')
-        ) {
-          paragraphs.add(text);
-          console.log(
-            `Đã tìm thấy đoạn nội dung: "${text.substring(0, 50)}..."`
-          );
-        }
-      }
-
-      postText = Array.from(paragraphs).join('\n\n');
-
-      if (!postText) {
-        console.warn('Không tìm thấy nội dung văn bản!');
-      }
-
-      // Các thông tin khác giữ nguyên theo hàm hiện tại
-
+      // 3. Trích xuất các thông tin khác
       return {
         postId,
         content: postText || '[No content extracted]',
-        author: this.extractAuthor(postElement) || 'Unknown',
+        author: this.extractAuthor(postElement) || {
+          name: 'Unknown',
+          id: null,
+          profileUrl: null
+        },
         timestamp:
           this.extractTimestamp(postElement) || new Date().toISOString(),
+        images: this.extractImages(postElement) || [],
         likes: this.extractLikes(postElement) || 0,
         comments: (await this.extractComments(postElement)) || [],
         extraction_success: !!postText
@@ -730,129 +746,109 @@ class FacebookScraper {
   }
 
   /**
-   * Get all posts currently visible in the feed (optimized)
+   * Get all posts with improved duplicate detection
    */
   getPosts() {
     try {
-      // Log để debug
-      console.log('Bắt đầu tìm các bài viết...');
+      // Find feed element
+      const feed =
+        document.querySelector('[role="feed"]') ||
+        document.querySelector('[data-pagelet="GroupFeed"]') ||
+        document.body;
 
-      // Tìm feed container
-      const feed = document.querySelector('[role="feed"]') || document.body;
       if (!feed) {
-        this.log('Không tìm thấy feed');
+        console.error('Feed element not found');
         return [];
       }
-      this.log('Đã tìm thấy feed, đang trích xuất bài viết');
 
-      // Selector chính xác hơn cho bài viết Facebook dựa trên cấu trúc HTML thực tế
+      // Tối ưu số lượng selector, chỉ giữ lại các selector hiệu quả nhất
+      // và loại bỏ các selector quá rộng
       const selectors = [
-        // Selector chính: article element nhưng không phải comment
-        '[role="article"]:not([aria-label*="Comment"])',
-        '[role="article"]:not([aria-label*="Bình luận"])',
+        // Selector chính và đáng tin cậy nhất
+        '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])',
 
-        // Thêm các selector đơn giản hơn từ cấu trúc HTML thực tế
-        'div[role="article"]',
-        '.x1n2onr6.x1ye3gou.x1iorvi4.x78zum5',
-
-        // Các selector dự phòng dựa trên cấu trúc HTML
-        'div.x1yztbdb:not([aria-label*="Comment"])',
-        'div.x1n2onr6.x1ja2u2z:has(div.x78zum5.xdt5ytf)',
-        'div.x9f619.x1n2onr6.x1ja2u2z:not([role="button"])',
-
-        // Các selector cũ vẫn giữ lại
-        'div.x1lliihq:has(div[data-ad-comet-preview="message"])',
-        'div.x78zum5:has(div[dir="auto"][style*="text-align"])',
-        'div.xexx8yu:has(a[role="link"])'
+        // Selector dự phòng (giới hạn hơn)
+        'div.x1yztbdb:not([aria-label*="Comment"]):has(div[data-ad-comet-preview="message"])',
+        'div.x1lliihq:has(div[data-ad-comet-preview="message"])'
       ];
 
-      // Sử dụng mảng để lưu trữ kết quả và xử lý sau này
-      const postElements = [];
+      // Sử dụng Set để lưu trữ các phần tử duy nhất dựa trên ID
+      const uniquePosts = new Map();
 
       // Thử từng selector
-      selectors.forEach((selector) => {
+      for (const selector of selectors) {
         try {
           const elements = feed.querySelectorAll(selector);
-          console.log(
+          this.log(
             `Selector "${selector}" tìm thấy ${elements.length} phần tử`
           );
 
-          elements.forEach((el) => {
+          for (const el of elements) {
             // Bỏ qua các phần tử nhỏ (có thể là comment, button, etc)
-            if (el.offsetHeight > 100) {
-              // Log ra để debugging
-              console.log('Phần tử tìm thấy:', {
-                height: el.offsetHeight,
-                text: el.textContent.substring(0, 100) + '...',
-                isArticle:
-                  el.hasAttribute('role') &&
-                  el.getAttribute('role') === 'article'
-              });
+            if (el.offsetHeight < 100) continue;
 
-              // Kiểm tra xem có phải bình luận không
-              const isComment =
-                el.getAttribute('aria-label')?.includes('Comment') ||
-                el.getAttribute('aria-label')?.includes('Bình luận') ||
-                el.textContent.includes('View more comments') ||
-                el.textContent.includes('Xem thêm bình luận');
+            // Kiểm tra xem có phải bình luận không
+            const isComment =
+              el.getAttribute('aria-label')?.includes('Comment') ||
+              el.getAttribute('aria-label')?.includes('Bình luận') ||
+              el.textContent.includes('View more comments') ||
+              el.textContent.includes('Xem thêm bình luận');
 
-              // Kiểm tra có phải là bài viết hợp lệ hoặc có nội dung đủ dài
-              const hasContent = el.textContent.length > 100;
+            if (isComment) continue;
 
-              if (!isComment && hasContent && !postElements.includes(el)) {
-                postElements.push(el);
+            // Lấy ID của bài viết
+            const postId = this.extractPostId(el);
+
+            if (postId && !this.processedIds.has(postId)) {
+              // Thêm bài viết vào danh sách và đánh dấu đã xử lý
+              this.processedIds.add(postId);
+
+              // Lưu bài viết vào map với postId làm khóa để đảm bảo duy nhất
+              if (!uniquePosts.has(postId)) {
+                uniquePosts.set(postId, { element: el, id: postId });
+
+                // Debug visualization
+                if (this.debugMode) {
+                  el.setAttribute('data-fb-scraper', 'processed');
+                  setTimeout(() => {
+                    el.removeAttribute('data-fb-scraper');
+                  }, 1000);
+                }
               }
             }
-          });
+          }
         } catch (error) {
           console.error(`Lỗi với selector ${selector}:`, error);
         }
-      });
-
-      this.log(`Tìm thấy ${postElements.length} bài viết tiềm năng`);
-
-      // Xử lý các bài viết tìm thấy
-      const processQueue = [];
-      for (const element of postElements) {
-        const id = this.extractPostId(element);
-        if (id && !this.processedIds.has(id)) {
-          this.processedIds.add(id);
-          processQueue.push({ element, id });
-
-          if (this.debugMode) {
-            element.setAttribute('data-fb-scraper', 'processed');
-            setTimeout(() => {
-              element.removeAttribute('data-fb-scraper');
-            }, 1000);
-          }
-        }
       }
 
-      // Xử lý ngay một số bài viết
+      // Chuyển map thành mảng để xử lý
+      const processQueue = Array.from(uniquePosts.values());
+      this.log(`Tìm thấy ${processQueue.length} bài viết duy nhất`);
+
+      // Xử lý các bài viết
       if (processQueue.length > 0) {
         const initialBatch = processQueue.splice(
           0,
           Math.min(3, processQueue.length)
         );
-
         for (const { element, id } of initialBatch) {
           this.extractPostData(element).then((post) => {
-            if (post) this.scrapedPosts.push(post);
+            if (post) {
+              this.scrapedPosts.push(post);
+            }
           });
         }
 
-        // Xử lý các bài viết còn lại trong background nếu cần
+        // Xử lý những bài còn lại theo queue
         if (processQueue.length > 0) {
-          setTimeout(() => {
-            this.processRemainingPosts(processQueue);
-          }, 100);
+          setTimeout(() => this.processRemainingPosts(processQueue), 200);
         }
       }
 
-      // ĐÂY LÀ PHẦN QUAN TRỌNG - trả về kết quả của hàm
-      return postElements;
+      return processQueue.map((p) => p.element);
     } catch (error) {
-      console.error('Lỗi khi lấy bài viết:', error);
+      console.error('Error getting posts:', error);
       return [];
     }
   }
@@ -861,37 +857,27 @@ class FacebookScraper {
    * Process remaining posts in the background
    */
   processRemainingPosts(queue) {
-    // Process in small batches to keep UI responsive
-    const batch = queue.splice(0, 3);
+    // Xử lý theo batch lớn hơn để giảm số lần gọi hàm
+    const batch = queue.splice(0, 5); // Tăng từ 3 lên 5
 
-    batch.forEach(({ element, id }) => {
-      const post = this.extractPostData(element);
-      if (post) {
-        this.scrapedPosts.push(post);
-
-        // For debugging
-        if (this.debugMode) {
-          // Highlight scraped posts temporarily
-          element.setAttribute('data-fb-scraper', 'processed-background');
-          setTimeout(() => {
-            element.removeAttribute('data-fb-scraper');
-          }, 500);
+    Promise.all(
+      batch.map(async ({ element, id }) => {
+        const post = await this.extractPostData(element);
+        if (post) {
+          this.scrapedPosts.push(post);
+          // Highlighting code...
         }
+      })
+    ).then(() => {
+      if (queue.length > 0) {
+        setTimeout(() => this.processRemainingPosts(queue), 100);
+      } else if (
+        this.isCollecting &&
+        this.scrapedPosts.length >= this.postsToCollect
+      ) {
+        this.finishCollection();
       }
     });
-
-    // If more remain, schedule next batch
-    if (queue.length > 0) {
-      setTimeout(() => {
-        this.processRemainingPosts(queue);
-      }, 100);
-    } else if (
-      this.isCollecting &&
-      this.scrapedPosts.length >= this.postsToCollect
-    ) {
-      // We have enough posts, finish collection
-      this.finishCollection();
-    }
   }
 
   /**
@@ -910,6 +896,8 @@ class FacebookScraper {
     if (this.sentinelElement && this.sentinelElement.parentNode) {
       this.sentinelElement.parentNode.removeChild(this.sentinelElement);
     }
+
+    clearInterval(this.cleanupInterval);
 
     // Prepare result
     const result = {
@@ -953,6 +941,50 @@ class FacebookScraper {
     }
 
     return result;
+  }
+
+  /**
+   * Finish collection and save results
+   */
+  finishCollection() {
+    this.isCollecting = false;
+    if (this.observer) {
+      this.observer.disconnect();
+    }
+
+    // Thêm dòng này để loại bỏ các bài trùng lặp
+    this.removeDuplicatePosts();
+
+    this.log(`Finishing collection with ${this.scrapedPosts.length} posts`);
+
+    // Create the final result object
+    const result = {
+      group: this.groupInfo,
+      posts: this.scrapedPosts,
+      totalScraped: this.scrapedPosts.length,
+      isComplete: true,
+      lastSaved: new Date().toISOString()
+    };
+
+    // Save to local storage as backup
+    try {
+      localStorage.setItem('fb-scraper-result', JSON.stringify(result));
+      this.log('Results saved to localStorage for backup');
+    } catch (e) {
+      console.error('Failed to save to localStorage:', e);
+    }
+
+    // Send result back to extension
+    try {
+      chrome.runtime.sendMessage({
+        action: 'scraperResult',
+        result: result
+      });
+    } catch (e) {
+      console.error('Error in messaging:', e);
+      // Provide fallback download method in case extension communication fails
+      this.createDownloadLink(result);
+    }
   }
 
   /**
@@ -1139,6 +1171,18 @@ class FacebookScraper {
     if (this.scrapedPosts.length < this.postsToCollect) {
       this.loadMoreContent();
     }
+
+    this.cleanupInterval = setInterval(() => {
+      if (this.scrapedPosts.length > this.postsToCollect * 1.5) {
+        // Giữ lại số bài viết mới nhất cần thiết
+        this.scrapedPosts = this.scrapedPosts.slice(-this.postsToCollect);
+        console.log(
+          'Đã dọn dẹp bộ nhớ, giữ lại',
+          this.scrapedPosts.length,
+          'bài viết'
+        );
+      }
+    }, 10000);
   }
 
   /**
@@ -1182,6 +1226,7 @@ class FacebookScraper {
 
     clearInterval(this.progressInterval);
     clearInterval(this.backupScrollTimer); // Clear backup timer
+    clearInterval(this.cleanupInterval);
 
     // Remove debugging styles
     const style = document.getElementById('fb-scraper-style');
@@ -1233,6 +1278,670 @@ class FacebookScraper {
     } catch (e) {
       this.log('Error saving partial data to localStorage:', e.message);
     }
+  }
+
+  /**
+   * Phương pháp trích xuất nội dung mạnh hơn từ bài đăng Facebook
+   * @param {HTMLElement} postElement - Phần tử DOM của bài đăng
+   * @returns {string} - Nội dung bài đăng đã trích xuất
+   */
+  extractPostContentAdvanced(postElement) {
+    if (!postElement) return '';
+
+    try {
+      console.log('Bắt đầu trích xuất nội dung nâng cao cho bài viết...');
+
+      // 1. Expand all "See more" buttons first
+      this.expandSeemoreButtons(postElement);
+
+      // 2. Try multiple extraction methods and combine results
+      const extractedContent = new Set();
+
+      // METHOD 1: Extract from known content containers using multiple passes
+      const contentSelectors = [
+        'span.x193iq5w', // Selector từ sample_post.html
+        'div.xdj266r div.x1e56ztr', // Container phổ biến cho nội dung
+        '[data-ad-comet-preview="message"]', // Facebook message preview
+        'div[dir="auto"]', // Generic text containers
+        'span[dir="auto"]', // Spans with direct text
+        'div.x1iorvi4 span', // Latest Facebook content container
+        'div.xdj266r span' // Container từ mẫu HTML
+      ];
+
+      for (const selector of contentSelectors) {
+        try {
+          const elements = postElement.querySelectorAll(selector);
+          for (const el of elements) {
+            const text = el.textContent?.trim();
+            // Skip small texts, UI elements, timestamps
+            if (
+              text &&
+              text.length > 30 && // Dài hơn để lấy nội dung chính
+              !text.includes('Like') &&
+              !text.includes('Comment') &&
+              !text.includes('Share') &&
+              !text.includes('Thích') &&
+              !text.includes('Bình luận') &&
+              !text.includes('Chia sẻ') &&
+              !text.match(/^\d+\s+(minute|hour|day|phút|giờ|ngày)/)
+            ) {
+              extractedContent.add(text);
+              console.log(
+                `Tìm thấy nội dung từ ${selector}:`,
+                text.substring(0, 50) + '...'
+              );
+            }
+          }
+        } catch (e) {
+          console.debug(`Lỗi khi truy vấn selector ${selector}:`, e);
+        }
+      }
+
+      // METHOD 2: Extract from raw HTML - tìm nội dung bài đăng từ HTML
+      try {
+        const html = postElement.innerHTML;
+
+        // Tìm JSON data trong HTML
+        const jsonPatterns = [
+          /"message":\s*{\s*"text":\s*"([^"]+?)"/,
+          /"text":\s*"([^"]+?)"/,
+          /"story":\s*{\s*"message":\s*{\s*"text":\s*"([^"]+?)"/
+        ];
+
+        for (const pattern of jsonPatterns) {
+          const matches = html.match(new RegExp(pattern, 'g'));
+          if (matches) {
+            matches.forEach((match) => {
+              const contentMatch = match.match(pattern);
+              if (contentMatch && contentMatch[1]) {
+                // Decode JSON escape sequences
+                const decodedText = contentMatch[1]
+                  .replace(/\\n/g, '\n')
+                  .replace(/\\"/g, '"')
+                  .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+                    String.fromCharCode(parseInt(hex, 16))
+                  );
+
+                if (decodedText.length > 30) {
+                  extractedContent.add(decodedText);
+                  console.log(
+                    'Tìm thấy nội dung từ JSON pattern:',
+                    decodedText.substring(0, 50) + '...'
+                  );
+                }
+              }
+            });
+          }
+        }
+      } catch (e) {
+        console.debug('Lỗi khi phân tích HTML:', e);
+      }
+
+      // METHOD 3: Deepest text node scan - quét sâu
+      try {
+        const textNodes = this.getAllTextNodes(postElement);
+        const longTextNodes = textNodes.filter((node) => {
+          const text = node.textContent?.trim();
+          return text && text.length > 60; // Only substantial content
+        });
+
+        longTextNodes.forEach((node) => {
+          extractedContent.add(node.textContent.trim());
+        });
+
+        console.log(
+          `Tìm thấy ${longTextNodes.length} text nodes với nội dung dài`
+        );
+      } catch (e) {
+        console.debug('Lỗi khi quét text nodes:', e);
+      }
+
+      // METHOD 4: Extract from attributes - một số nội dung ẩn trong attributes
+      try {
+        const elementsWithAttrs = postElement.querySelectorAll(
+          '[aria-label], [data-content], [title]'
+        );
+        for (const el of elementsWithAttrs) {
+          for (const attr of ['aria-label', 'data-content', 'title']) {
+            const content = el.getAttribute(attr);
+            if (
+              content &&
+              content.length > 60 &&
+              !content.includes('reaction')
+            ) {
+              extractedContent.add(content);
+            }
+          }
+        }
+      } catch (e) {
+        console.debug('Lỗi khi trích xuất từ attributes:', e);
+      }
+
+      // METHOD 5: Extract from image alt texts - lấy nội dung từ ảnh
+      try {
+        const images = postElement.querySelectorAll('img[alt]');
+        for (const img of images) {
+          const alt = img.getAttribute('alt');
+          if (
+            alt &&
+            alt.length > 100 &&
+            (alt.includes('.') || alt.match(/[A-Z][a-z]+ [A-Z][a-z]+/))
+          ) {
+            // Dấu hiệu của một câu/đoạn văn
+            extractedContent.add(alt);
+            console.log(
+              'Tìm thấy nội dung từ alt của ảnh:',
+              alt.substring(0, 50) + '...'
+            );
+          }
+        }
+      } catch (e) {
+        console.debug('Lỗi khi trích xuất từ alt của ảnh:', e);
+      }
+
+      // Combine all extracted content, filter duplicates
+      const combinedContent = Array.from(extractedContent)
+        // Sort by length descending - ưu tiên đoạn dài
+        .sort((a, b) => b.length - a.length)
+        // Remove near duplicates - bỏ đoạn gần giống nhau
+        .filter((text, index, array) => {
+          // Skip if this text is a substring of a longer text that appears earlier in the array
+          return !array
+            .slice(0, index)
+            .some(
+              (prevText) =>
+                prevText.includes(text) && prevText.length > text.length * 1.2
+            );
+        });
+
+      // Log extraction results
+      console.log(`Extracted ${combinedContent.length} content sections`);
+
+      // Join all the pieces with newlines
+      return combinedContent.join('\n\n');
+    } catch (error) {
+      console.error('Error in advanced content extraction:', error);
+      return '';
+    }
+  }
+
+  /**
+   * Expand all "See more" buttons in a post element
+   */
+  async expandSeemoreButtons(postElement) {
+    const buttonSelectors = [
+      '[role="button"]',
+      'div.x1i10hfl[tabindex="0"]',
+      'span.x1i10hfl[tabindex="0"]',
+      'div.xsdox4t[tabindex="0"]'
+    ];
+
+    // Try multiple passes as new buttons may appear after expanding others
+    for (let pass = 0; pass < 3; pass++) {
+      let expanded = false;
+
+      for (const selector of buttonSelectors) {
+        const buttons = postElement.querySelectorAll(selector);
+        for (const button of buttons) {
+          // Check if it's a "See more" button by text content
+          const text = button.textContent.toLowerCase();
+          if (
+            text.includes('see more') ||
+            text.includes('xem thêm') ||
+            text.includes('... more') ||
+            text.includes('...more')
+          ) {
+            try {
+              console.log('Clicking "See more" button:', text);
+              button.click();
+              expanded = true;
+              // Pause briefly to let content expand
+              await new Promise((resolve) => setTimeout(resolve, 300));
+            } catch (e) {
+              console.debug('Error clicking see more button:', e);
+            }
+          }
+        }
+      }
+
+      if (!expanded) break; // No more buttons expanded, so exit
+
+      // Wait a bit longer between passes
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  /**
+   * Get all text nodes from an element recursively
+   */
+  getAllTextNodes(element) {
+    const textNodes = [];
+
+    // Skip certain elements that are unlikely to contain post content
+    const skipTags = ['SCRIPT', 'STYLE', 'SVG', 'BUTTON', 'INPUT'];
+    const skipRoles = ['button', 'tab', 'menuitem'];
+    const skipClass = ['xcm5owa', 'x1le4gvd', 'x78zum5'];
+
+    if (skipTags.includes(element.tagName)) return textNodes;
+    if (
+      element.getAttribute &&
+      skipRoles.includes(element.getAttribute('role'))
+    )
+      return textNodes;
+    if (
+      element.className &&
+      skipClass.some((cls) => element.className.includes(cls))
+    )
+      return textNodes;
+
+    // Get text nodes from this element
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => {
+        const text = node.textContent.trim();
+        // Accept non-empty text nodes
+        return text ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      textNodes.push(node);
+    }
+
+    return textNodes;
+  }
+
+  /**
+   * Use XPath to find elements - sometimes more powerful than CSS selectors
+   */
+  getElementByXPath(xpath, contextNode = document) {
+    try {
+      const result = document.evaluate(
+        xpath,
+        contextNode,
+        null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        null
+      );
+
+      const elements = [];
+      for (let i = 0; i < result.snapshotLength; i++) {
+        elements.push(result.snapshotItem(i));
+      }
+
+      return elements;
+    } catch (e) {
+      console.debug('XPath error:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Extract post content using XPath expressions
+   */
+  extractContentWithXPath(postElement) {
+    const contentPieces = [];
+
+    try {
+      // XPath biểu thức cho các phần tử có thể chứa nội dung
+      const xpaths = [
+        // Text nodes that have substantial content (more than 80 chars)
+        './/text()[string-length(normalize-space(.)) > 80]',
+
+        // Div elements with substantial direct text
+        './/div[string-length(normalize-space(text())) > 80]',
+
+        // Span elements with substantial text
+        './/span[string-length(normalize-space(text())) > 80]',
+
+        // Specific to Facebook content structure
+        './/div[contains(@class, "xdj266r")]//span[contains(@class, "x193iq5w")]',
+
+        // Image alt text that may contain content
+        './/img[string-length(@alt) > 100]/@alt'
+      ];
+
+      for (const xpath of xpaths) {
+        const elements = this.getElementByXPath(xpath, postElement);
+
+        for (const el of elements) {
+          // For attribute nodes (like @alt)
+          if (el.nodeType === 2) {
+            // Attribute node
+            contentPieces.push(el.value);
+            continue;
+          }
+
+          // For text or element nodes
+          const text = el.textContent?.trim();
+          if (
+            text &&
+            text.length > 40 &&
+            !text.includes('Thích') &&
+            !text.includes('Like') &&
+            !text.includes('Comment')
+          ) {
+            contentPieces.push(text);
+          }
+        }
+      }
+    } catch (e) {
+      console.debug('Error in XPath content extraction:', e);
+    }
+
+    return contentPieces;
+  }
+
+  /**
+   * Extract content directly from Facebook's internal data structures
+   * This is the most aggressive method that tries to access FB's internal data
+   */
+  extractFromFacebookInternals() {
+    try {
+      // Tìm tất cả các script tags trong trang
+      const scripts = document.querySelectorAll('script');
+      const results = [];
+
+      // Tìm kiếm cấu trúc dữ liệu nội bộ của Facebook
+      for (const script of scripts) {
+        const text = script.textContent || '';
+
+        // Tìm kiếm các cấu trúc dữ liệu có thể chứa nội dung bài viết
+        if (
+          text.includes('"story_attachment_style"') ||
+          text.includes('"message"') ||
+          text.includes('"story":')
+        ) {
+          // Tìm các đối tượng JSON có khả năng chứa nội dung
+          const jsonPattern = /\{"require":\[.+?\],"define":\[.+?\]}/g;
+          const jsonMatches = text.match(jsonPattern);
+
+          if (jsonMatches) {
+            for (const jsonStr of jsonMatches) {
+              try {
+                // Phân tích cú pháp JSON
+                const data = JSON.parse(jsonStr);
+
+                // Đào sâu vào cấu trúc để tìm nội dung
+                this.extractNestedContent(data, results);
+              } catch (e) {
+                // Bỏ qua lỗi JSON parsing
+              }
+            }
+          }
+        }
+      }
+
+      return results;
+    } catch (error) {
+      console.error('Error extracting from Facebook internals:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Đào sâu vào các cấu trúc JSON để tìm nội dung
+   */
+  extractNestedContent(obj, results, depth = 0) {
+    // Giới hạn độ sâu để tránh đệ quy vô hạn
+    if (depth > 10) return;
+
+    try {
+      // Nếu là mảng, duyệt qua từng phần tử
+      if (Array.isArray(obj)) {
+        for (const item of obj) {
+          this.extractNestedContent(item, results, depth + 1);
+        }
+        return;
+      }
+
+      // Nếu không phải object, bỏ qua
+      if (!obj || typeof obj !== 'object') return;
+
+      // Kiểm tra các thuộc tính quan trọng
+      for (const key in obj) {
+        // Tìm các khóa liên quan đến nội dung
+        if (
+          ['text', 'message', 'content', 'body', 'description'].includes(key)
+        ) {
+          const value = obj[key];
+
+          // Nếu là string và đủ dài, đây có thể là nội dung
+          if (typeof value === 'string' && value.length > 50) {
+            results.push(value);
+          }
+          // Nếu là object và có text, đây có thể là nội dung có định dạng
+          else if (value && typeof value === 'object' && value.text) {
+            if (typeof value.text === 'string' && value.text.length > 50) {
+              results.push(value.text);
+            }
+          }
+        }
+
+        // Đào sâu hơn vào các thuộc tính khác
+        this.extractNestedContent(obj[key], results, depth + 1);
+      }
+    } catch (e) {
+      // Bỏ qua lỗi
+    }
+  }
+
+  /**
+   * Master method that combines all extraction techniques
+   */
+  async extractAllContent(postElement) {
+    // Array to hold content from all methods
+    const allContent = new Set();
+
+    // Method 1: Standard method
+    const standardContent = this.extractPostContentAdvanced(postElement);
+    if (standardContent) {
+      standardContent.split('\n\n').forEach((text) => allContent.add(text));
+    }
+
+    // Method 2: XPath method
+    const xpathContent = this.extractContentWithXPath(postElement);
+    xpathContent.forEach((text) => allContent.add(text));
+
+    // Method 3: Try to access Facebook internals
+    const internalContent = this.extractFromFacebookInternals();
+    internalContent.forEach((text) => allContent.add(text));
+
+    // Sort by length (longest first) and filter duplicates
+    return Array.from(allContent)
+      .sort((a, b) => b.length - a.length)
+      .filter((text, index, array) => {
+        // Remove near-duplicates
+        const isDuplicate = array.slice(0, index).some((prevText) => {
+          // If this text is mostly contained in a previous longer text
+          if (prevText.length > text.length * 1.2) {
+            return (
+              prevText.includes(text) ||
+              this.calculateSimilarity(prevText, text) > 0.85
+            );
+          }
+          return false;
+        });
+        return !isDuplicate;
+      })
+      .join('\n\n');
+  }
+
+  /**
+   * Calculate similarity between two strings (simple implementation)
+   */
+  calculateSimilarity(str1, str2) {
+    // Quick check for very different length strings
+    if (
+      Math.abs(str1.length - str2.length) / Math.max(str1.length, str2.length) >
+      0.3
+    ) {
+      return 0;
+    }
+
+    // Simple similarity based on common words
+    const words1 = str1.toLowerCase().split(/\W+/);
+    const words2 = str2.toLowerCase().split(/\W+/);
+
+    // Create sets of unique words
+    const set1 = new Set(words1);
+    const set2 = new Set(words2);
+
+    // Count common words
+    let common = 0;
+    for (const word of set1) {
+      if (set2.has(word)) common++;
+    }
+
+    // Return Jaccard similarity
+    return common / (set1.size + set2.size - common);
+  }
+
+  /**
+   * Extract author information from a post
+   * @param {HTMLElement} postElement - The post DOM element
+   * @returns {Object} Author info
+   */
+  extractAuthor(postElement) {
+    try {
+      // Nhiều chiến lược selector khác nhau cho author
+      const authorSelectors = [
+        'h3 a',
+        'h4 a',
+        'h2 a',
+        '[role="link"][tabindex="0"]',
+        'a[role="link"][tabindex="0"]',
+        'a.x1i10hfl[href*="/user/"]', // User links
+        'span.x193iq5w a', // Modern FB structure
+        'a[aria-label]:not([aria-label*="comment"])', // Links with labels
+        '.x1heor9g a', // New FB post header structure
+        '.x1y1aw1k a' // Another FB post header class
+      ];
+
+      let authorElement = null;
+      for (const selector of authorSelectors) {
+        try {
+          const elements = postElement.querySelectorAll(selector);
+          for (const el of elements) {
+            // Bỏ qua links đến ảnh hoặc nút like/comment
+            if (
+              el.href &&
+              !el.href.includes('photo.php') &&
+              !el.href.includes('reaction') &&
+              !el.textContent.includes('Like') &&
+              !el.textContent.includes('Comment')
+            ) {
+              authorElement = el;
+              break;
+            }
+          }
+          if (authorElement) break;
+        } catch (e) {
+          // Bỏ qua selector lỗi
+        }
+      }
+
+      if (!authorElement) {
+        console.log('Không tìm thấy tác giả, dùng "Unknown"');
+        return {
+          name: 'Unknown',
+          id: null,
+          profileUrl: null
+        };
+      }
+
+      const authorName = authorElement.textContent.trim();
+      const authorProfileUrl = authorElement.href || null;
+      let authorId = null;
+
+      // Trích xuất ID từ URL profile
+      if (authorProfileUrl) {
+        const authorIdMatch = authorProfileUrl.match(
+          /\/(?:profile\.php\?id=(\d+)|([^?/]+))/
+        );
+        if (authorIdMatch) {
+          authorId = authorIdMatch[1] || authorIdMatch[2];
+        }
+      }
+
+      return {
+        name: authorName || 'Unknown',
+        id: authorId,
+        profileUrl: authorProfileUrl
+      };
+    } catch (error) {
+      console.error('Lỗi khi trích xuất thông tin tác giả:', error);
+      return {
+        name: 'Unknown',
+        id: null,
+        profileUrl: null
+      };
+    }
+  }
+
+  /**
+   * Extract likes/reactions count from a post
+   * @param {HTMLElement} postElement - The post DOM element
+   * @returns {number} Number of reactions
+   */
+  extractLikes(postElement) {
+    try {
+      // Multiple selector strategies for reactions
+      const reactionSelectors = [
+        '[aria-label*="reactions"]',
+        '[aria-label*="like"]',
+        '[aria-label*="thích"]',
+        'span[data-testid="like"]',
+        'div[data-testid="UFI2ReactionsCount"]',
+        '.x16hj40l span', // Modern FB reaction counter
+        'span.x193iq5w span.xt0psk2', // Another reaction counter format
+        'span.x1e558r4' // Yet another reaction structure
+      ];
+
+      for (const selector of reactionSelectors) {
+        try {
+          const elements = postElement.querySelectorAll(selector);
+          for (const el of elements) {
+            const text = el.getAttribute('aria-label') || el.textContent;
+            // Tìm kiếm số lượng trong text
+            const match = text.match(/(\d+)/);
+            if (match) {
+              return parseInt(match[0], 10);
+            }
+          }
+        } catch (e) {
+          // Skip failed selectors
+        }
+      }
+
+      return 0; // Mặc định 0 nếu không tìm thấy
+    } catch (error) {
+      console.error('Lỗi khi trích xuất số lượng thích:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Loại bỏ các bài trùng lặp trước khi lưu
+   */
+  removeDuplicatePosts() {
+    const seen = new Set();
+    this.scrapedPosts = this.scrapedPosts.filter((post) => {
+      // Sử dụng content làm "fingerprint" nếu không có postId
+      const uniqueKey =
+        post.postId ||
+        this.createContentFingerprint({ textContent: post.content });
+
+      // Trả về false nếu đã thấy key này, true nếu chưa thấy
+      if (seen.has(uniqueKey)) {
+        return false;
+      } else {
+        seen.add(uniqueKey);
+        return true;
+      }
+    });
+
+    this.log(`Sau khi loại bỏ trùng lặp: ${this.scrapedPosts.length} bài viết`);
   }
 }
 
