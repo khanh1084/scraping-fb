@@ -291,244 +291,93 @@ class FacebookScraper {
     if (!postElement) return null;
 
     try {
-      // Debug info about the post element
-      if (this.debugMode) {
-        console.log('Processing element:', {
-          height: postElement.offsetHeight,
-          contentLength: postElement.textContent.length,
-          hasLinks: postElement.querySelectorAll('a').length,
-          hasImages: postElement.querySelectorAll('img').length
-        });
-      }
+      console.log('Đang xử lý bài viết:', {
+        role: postElement.getAttribute('role'),
+        class: postElement.className,
+        height: postElement.offsetHeight
+      });
 
-      // Expand "See more" links first
-      const seeMoreButtons = postElement.querySelectorAll(
-        '[role="button"]:not([aria-expanded="false"]):not([aria-haspopup="menu"])'
-      );
-      for (const button of seeMoreButtons) {
+      // Expand all "See more" buttons
+      const buttons = postElement.querySelectorAll('[role="button"]');
+      for (const button of buttons) {
         if (
           button.textContent.includes('See more') ||
           button.textContent.includes('Xem thêm')
         ) {
           try {
-            // Try to click the "See more" button
             button.click();
-            // Wait a moment for content to expand
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            await new Promise((resolve) => setTimeout(resolve, 300));
           } catch (e) {
-            // Ignore click errors
+            console.warn('Lỗi khi nhấn nút xem thêm:', e);
           }
         }
       }
 
-      // Get post ID first (for early duplicate detection)
-      const postId = this.extractPostId(postElement);
+      // Lấy ID của bài viết
+      const postId =
+        this.extractPostId(postElement) || `generated_${Date.now()}`;
 
-      // Get author info with improved selector strategies
-      const authorSelectors = [
-        'h3 a',
-        'h4 a',
-        'h2 a',
-        '[role="link"][tabindex="0"]',
-        'a[role="link"][tabindex="0"]',
-        // New selectors for Facebook's updated structure
-        'a.x1i10hfl[href*="/user/"]',
-        'a.x1i10hfl[href*="/profile.php"]',
-        'div[data-ad-preview="message"] a[role="link"]'
-      ];
-
-      let authorElement = null;
-      for (const selector of authorSelectors) {
-        try {
-          const elements = postElement.querySelectorAll(selector);
-          for (const el of elements) {
-            if (
-              el &&
-              el.textContent &&
-              el.href &&
-              !el.href.includes('photo.php') &&
-              !el.textContent.includes('See more') &&
-              !el.textContent.includes('Xem thêm')
-            ) {
-              authorElement = el;
-              break;
-            }
-          }
-          if (authorElement) break;
-        } catch (e) {
-          // Continue to next selector
-        }
-      }
-
-      const authorName = authorElement
-        ? authorElement.textContent.trim()
-        : 'Unknown';
-      const authorProfileUrl = authorElement?.href || null;
-      const authorIdMatch = authorProfileUrl
-        ? authorProfileUrl.match(/\/(?:profile\.php\?id=(\d+)|([^?/]+))/)
-        : null;
-      const authorId = authorIdMatch
-        ? authorIdMatch[1] || authorIdMatch[2]
-        : null;
-
-      // Get post content with multiple selectors - more comprehensive
-      const contentSelectors = [
-        '[data-ad-comet-preview="message"]',
-        '[data-ad-preview="message"]',
-        'div[dir="auto"][style*="text-align"]',
-        '.userContent',
-        '.story_body_container div[dir="auto"]',
-        // New selectors for Facebook's new structure
-        'div.x1iorvi4 span',
-        'div.xdj266r div.xdj266r',
-        'div[data-ad-comet-preview="message"] span',
-        'div.x1lliihq > div.x1lliihq',
-        'span.x193iq5w'
-      ];
-
-      // Get all content elements and combine their text
+      // THAY ĐỔI: Sử dụng cách tiếp cận khác để lấy nội dung
       let postText = '';
-      for (const selector of contentSelectors) {
-        try {
-          const elements = postElement.querySelectorAll(selector);
-          for (const el of elements) {
-            const text = el.textContent.trim();
-            if (
-              text &&
-              text.length > 10 &&
-              !text.includes('See more') &&
-              !text.includes('Xem thêm') &&
-              !text.includes('Like') &&
-              !text.includes('Comment') &&
-              !text.includes('Share')
-            ) {
-              postText += text + '\n';
-            }
-          }
-        } catch (e) {
-          // Continue to next selector
-        }
-      }
 
-      postText = postText.trim();
+      // 1. Thử lấy văn bản từ article
+      const contentContainers = [
+        ...postElement.querySelectorAll('div[dir="auto"]'),
+        ...postElement.querySelectorAll('[data-ad-comet-preview="message"]'),
+        ...postElement.querySelectorAll('span.x193iq5w'),
+        ...postElement.querySelectorAll('div.xdj266r')
+      ];
 
-      // If still no content, try a broader approach
-      if (!postText) {
-        try {
-          // Look for any substantial text content
-          const allTextElements = postElement.querySelectorAll(
-            'div[dir="auto"], span.x193iq5w, span.xexx8yu'
+      // 2. Lọc và kết hợp nội dung
+      const paragraphs = new Set();
+
+      for (const container of contentContainers) {
+        const text = container.textContent.trim();
+
+        // Bỏ qua nút, metadata và các phần tử ngắn
+        if (
+          text &&
+          text.length > 15 &&
+          !text.includes('See more') &&
+          !text.includes('Xem thêm') &&
+          !text.includes('Like') &&
+          !text.includes('Comment') &&
+          !text.includes('Share') &&
+          !text.includes('Thích') &&
+          !text.includes('Bình luận') &&
+          !text.includes('Chia sẻ') &&
+          !text.includes('ago') &&
+          !text.includes('phút') &&
+          !text.includes('giờ')
+        ) {
+          paragraphs.add(text);
+          console.log(
+            `Đã tìm thấy đoạn nội dung: "${text.substring(0, 50)}..."`
           );
-          for (const el of allTextElements) {
-            const text = el.textContent.trim();
-            if (text && text.length > 50) {
-              postText = text;
-              break;
-            }
-          }
-        } catch (e) {
-          // Ignore errors in fallback method
         }
       }
 
-      // Get images
-      const images = this.extractImages(postElement);
+      postText = Array.from(paragraphs).join('\n\n');
 
-      // Get reactions and comments with enhanced selectors
-      let reactionsCount = 0;
-      let commentsCount = 0;
-
-      // First try to extract using Facebook's native data attributes
-      try {
-        const reactionSection = postElement.querySelector(
-          '[aria-label*="reaction"], [aria-label*="Reaction"]'
-        );
-        if (reactionSection) {
-          const ariaLabel = reactionSection.getAttribute('aria-label');
-          const match = ariaLabel.match(/(\d+)/);
-          if (match) {
-            reactionsCount = parseInt(match[1], 10);
-          }
-        }
-      } catch (e) {
-        // Use fallback methods next
+      if (!postText) {
+        console.warn('Không tìm thấy nội dung văn bản!');
       }
 
-      // Fallback reaction detection
-      if (reactionsCount === 0) {
-        try {
-          const reactionElements =
-            postElement.querySelectorAll('.x1e558r4 span');
-          for (const el of reactionElements) {
-            const text = el.textContent.trim();
-            if (/^\d+$/.test(text)) {
-              reactionsCount = parseInt(text, 10);
-              break;
-            }
-          }
-        } catch (e) {
-          // Ignore fallback errors
-        }
-      }
+      // Các thông tin khác giữ nguyên theo hàm hiện tại
 
-      // Extract comments count
-      try {
-        const commentLinks = postElement.querySelectorAll('a[role="link"]');
-        for (const link of commentLinks) {
-          const text = link.textContent.trim();
-          // Look for numeric patterns followed by "comments" or similar text
-          const match = text.match(/(\d+)\s*(comment|bình luận|phản hồi)/i);
-          if (match) {
-            commentsCount = parseInt(match[1], 10);
-            break;
-          }
-        }
-      } catch (e) {
-        // Ignore comment counting errors
-      }
-
-      // Extract comments content if possible
-      const comments = await this.extractComments(postElement);
-
-      // Create post object with all extracted data
-      const result = {
-        postId: postId || `generated_${Date.now()}`,
-        author: {
-          name: authorName || 'Unknown',
-          id: authorId || null,
-          profileUrl: authorProfileUrl || null
-        },
+      return {
+        postId,
         content: postText || '[No content extracted]',
+        author: this.extractAuthor(postElement) || 'Unknown',
         timestamp:
           this.extractTimestamp(postElement) || new Date().toISOString(),
-        images: images || [],
-        reactions: reactionsCount || 0,
-        comments_count: commentsCount || 0,
-        comments: comments || [],
-        url: postId
-          ? `https://www.facebook.com/groups/${this.groupInfo?.id}/posts/${postId}/`
-          : null,
-        scraped_at: new Date().toISOString(),
-        extraction_success: !!postText // Flag indicating if extraction was successful
+        likes: this.extractLikes(postElement) || 0,
+        comments: (await this.extractComments(postElement)) || [],
+        extraction_success: !!postText
       };
-
-      // Only return posts that have some actual content
-      if (!postText && !images.length && !comments.length) {
-        return null;
-      }
-
-      return result;
     } catch (error) {
-      console.error('Error extracting post data:', error);
-      // Provide minimum valid object even on error
-      return {
-        postId: `error_${Date.now()}`,
-        content: '[Error extracting content]',
-        author: { name: 'Unknown' },
-        scraped_at: new Date().toISOString(),
-        extraction_success: false,
-        error: error.message
-      };
+      console.error('Lỗi khi trích xuất dữ liệu bài viết:', error);
+      return null;
     }
   }
 
@@ -885,114 +734,125 @@ class FacebookScraper {
    */
   getPosts() {
     try {
-      const feed = document.querySelector('[role="feed"]');
+      // Log để debug
+      console.log('Bắt đầu tìm các bài viết...');
+
+      // Tìm feed container
+      const feed = document.querySelector('[role="feed"]') || document.body;
       if (!feed) {
-        this.log('No feed found');
+        this.log('Không tìm thấy feed');
         return [];
       }
-      this.log('Feed found, extracting posts');
+      this.log('Đã tìm thấy feed, đang trích xuất bài viết');
 
-      // Use more specific selectors targeting actual posts
+      // Selector chính xác hơn cho bài viết Facebook dựa trên cấu trúc HTML thực tế
       const selectors = [
-        // Facebook's article elements are the most reliable
+        // Selector chính: article element nhưng không phải comment
         '[role="article"]:not([aria-label*="Comment"])',
+        '[role="article"]:not([aria-label*="Bình luận"])',
 
-        // Target elements that are likely to contain post content
+        // Thêm các selector đơn giản hơn từ cấu trúc HTML thực tế
+        'div[role="article"]',
+        '.x1n2onr6.x1ye3gou.x1iorvi4.x78zum5',
+
+        // Các selector dự phòng dựa trên cấu trúc HTML
+        'div.x1yztbdb:not([aria-label*="Comment"])',
+        'div.x1n2onr6.x1ja2u2z:has(div.x78zum5.xdt5ytf)',
+        'div.x9f619.x1n2onr6.x1ja2u2z:not([role="button"])',
+
+        // Các selector cũ vẫn giữ lại
         'div.x1lliihq:has(div[data-ad-comet-preview="message"])',
         'div.x78zum5:has(div[dir="auto"][style*="text-align"])',
-        'div.xexx8yu:has(a[role="link"])',
-
-        // The rest of your original selectors
-        '.xd665xh.x10l6tqk.x1dquyif',
-        '[data-ad-rendering-role="story_message"]',
-        '.x1yztbdb:not([role="button"])',
-        '.x78zum5.xdt5ytf.x1n2onr6',
-        '.x1lliihq.x1n2onr6'
+        'div.xexx8yu:has(a[role="link"])'
       ];
 
-      // Use a Set to avoid duplicates from different selectors
-      const postElements = new Set();
+      // Sử dụng mảng để lưu trữ kết quả và xử lý sau này
+      const postElements = [];
 
-      // Try each selector
+      // Thử từng selector
       selectors.forEach((selector) => {
-        const elements = feed.querySelectorAll(selector);
-        elements.forEach((el) => {
-          // Skip tiny elements that are likely not posts
-          if (el.offsetHeight > 50) {
-            postElements.add(el);
-          }
-        });
+        try {
+          const elements = feed.querySelectorAll(selector);
+          console.log(
+            `Selector "${selector}" tìm thấy ${elements.length} phần tử`
+          );
+
+          elements.forEach((el) => {
+            // Bỏ qua các phần tử nhỏ (có thể là comment, button, etc)
+            if (el.offsetHeight > 100) {
+              // Log ra để debugging
+              console.log('Phần tử tìm thấy:', {
+                height: el.offsetHeight,
+                text: el.textContent.substring(0, 100) + '...',
+                isArticle:
+                  el.hasAttribute('role') &&
+                  el.getAttribute('role') === 'article'
+              });
+
+              // Kiểm tra xem có phải bình luận không
+              const isComment =
+                el.getAttribute('aria-label')?.includes('Comment') ||
+                el.getAttribute('aria-label')?.includes('Bình luận') ||
+                el.textContent.includes('View more comments') ||
+                el.textContent.includes('Xem thêm bình luận');
+
+              // Kiểm tra có phải là bài viết hợp lệ hoặc có nội dung đủ dài
+              const hasContent = el.textContent.length > 100;
+
+              if (!isComment && hasContent && !postElements.includes(el)) {
+                postElements.push(el);
+              }
+            }
+          });
+        } catch (error) {
+          console.error(`Lỗi với selector ${selector}:`, error);
+        }
       });
 
-      this.log(`Found ${postElements.size} potential post elements`);
+      this.log(`Tìm thấy ${postElements.length} bài viết tiềm năng`);
 
-      const posts = [];
+      // Xử lý các bài viết tìm thấy
       const processQueue = [];
+      for (const element of postElements) {
+        const id = this.extractPostId(element);
+        if (id && !this.processedIds.has(id)) {
+          this.processedIds.add(id);
+          processQueue.push({ element, id });
 
-      // First pass: quickly find post IDs to filter duplicates
-      postElements.forEach((postElement) => {
-        // Skip ads and sponsored content
-        if (
-          postElement.querySelector('[aria-label="Sponsored"]') ||
-          postElement.textContent.includes('Suggested for you') ||
-          postElement.textContent.includes('Sponsored')
-        ) {
-          return;
-        }
-
-        // Extract post ID for duplicate detection
-        const postId = this.extractPostId(postElement);
-
-        if (postId && !this.processedIds.has(postId)) {
-          this.processedIds.add(postId);
-          processQueue.push({ element: postElement, id: postId });
-        }
-      });
-
-      this.log(`Added ${processQueue.length} new posts to processing queue`);
-
-      // Process an initial batch immediately (for responsive UI)
-      const batchSize = Math.min(5, processQueue.length);
-      for (let i = 0; i < batchSize; i++) {
-        const { element, id } = processQueue[i];
-        const post = this.extractPostData(element);
-        if (post) {
-          posts.push(post);
-          this.scrapedPosts.push(post);
-
-          // Log each post as JSON in console
-          console.log(`[FB Post JSON] Post ID: ${post.postId}`);
-          console.log(JSON.stringify(post, null, 2));
-
-          // For debugging
           if (this.debugMode) {
-            // Highlight scraped posts temporarily
             element.setAttribute('data-fb-scraper', 'processed');
             setTimeout(() => {
               element.removeAttribute('data-fb-scraper');
-            }, 500);
+            }, 1000);
           }
         }
       }
 
-      // Schedule remaining posts for background processing
-      if (processQueue.length > batchSize) {
-        setTimeout(() => {
-          this.processRemainingPosts(processQueue.slice(batchSize));
-        }, 0);
+      // Xử lý ngay một số bài viết
+      if (processQueue.length > 0) {
+        const initialBatch = processQueue.splice(
+          0,
+          Math.min(3, processQueue.length)
+        );
+
+        for (const { element, id } of initialBatch) {
+          this.extractPostData(element).then((post) => {
+            if (post) this.scrapedPosts.push(post);
+          });
+        }
+
+        // Xử lý các bài viết còn lại trong background nếu cần
+        if (processQueue.length > 0) {
+          setTimeout(() => {
+            this.processRemainingPosts(processQueue);
+          }, 100);
+        }
       }
 
-      // Log status update
-      this.log(
-        `Processed ${posts.length} posts immediately, queued ${
-          processQueue.length - batchSize
-        } for background processing`
-      );
-      this.log(`Total scraped posts so far: ${this.scrapedPosts.length}`);
-
-      return posts;
+      // ĐÂY LÀ PHẦN QUAN TRỌNG - trả về kết quả của hàm
+      return postElements;
     } catch (error) {
-      console.error('Error getting posts:', error);
+      console.error('Lỗi khi lấy bài viết:', error);
       return [];
     }
   }
@@ -1161,6 +1021,23 @@ class FacebookScraper {
    */
   async startCollecting(count = 50) {
     if (this.isCollecting) return;
+
+    console.log('=== BẮT ĐẦU QUÁ TRÌNH SCRAPE ===');
+    console.log('- Trạng thái ban đầu:', {
+      isCollecting: this.isCollecting,
+      isPaused: this.isPaused,
+      postsCount: this.scrapedPosts.length,
+      debugMode: this.debugMode
+    });
+    console.log('- Kiểm tra DOM:', {
+      feedExists: !!document.querySelector('[role="feed"]'),
+      articleElements: document.querySelectorAll('[role="article"]').length,
+      bodyContent: document.body.children.length
+    });
+
+    // Đặt thêm thời gian chờ cho DOM load hoàn toàn
+    console.log('- Đợi DOM tải hoàn toàn...');
+    await new Promise((resolve) => setTimeout(resolve, 2000));
 
     this.isCollecting = true;
     this.isPaused = false;
