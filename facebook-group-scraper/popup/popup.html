@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Facebook Group Scraper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Facebook Group Scraper</h1>
+  </header>
+  
+  <div id="not-facebook-group" class="message hidden">
+    <p>Please navigate to a Facebook Group page to use this extension.</p>
+  </div>
+  
+  <div id="main-content" class="hidden">
+    <div id="group-info">
+      <h2>Group Information</h2>
+      <div id="group-details">Loading...</div>
+    </div>
+    
+    <div id="scraping-options">
+      <h2>Scraping Options</h2>
+      <div class="option">
+        <label for="post-count">Number of posts to scrape:</label>
+        <input type="number" id="post-count" min="10" max="500" value="50">
+      </div>
+    </div>
+    
+    <div id="actions">
+      <button id="start-btn" class="primary">Start Scraping</button>
+      <button id="stop-btn" class="warning hidden">Stop Scraping</button>
+      <button id="download-btn" class="secondary" disabled>Download Data</button>
+    </div>
+    
+    <div id="progress" class="hidden">
+      <div class="progress-bar">
+        <div class="progress-value"></div>
+      </div>
+      <div class="progress-text">Scraped: <span id="posts-scraped">0</span> posts</div>
+    </div>
+    
+    <div id="results" class="hidden">
+      <h2>Results</h2>
+      <div id="results-summary"></div>
+    </div>
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>
