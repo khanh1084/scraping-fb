@@ -761,15 +761,9 @@ class FacebookScraper {
         return [];
       }
 
-      // Tối ưu số lượng selector, chỉ giữ lại các selector hiệu quả nhất
-      // và loại bỏ các selector quá rộng
-      const selectors = [
-        // Selector chính và đáng tin cậy nhất
-        '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])',
-
-        // Selector dự phòng (giới hạn hơn)
-        'div.x1yztbdb:not([aria-label*="Comment"]):has(div[data-ad-comet-preview="message"])',
-        'div.x1lliihq:has(div[data-ad-comet-preview="message"])'
+      // Use dynamically determined selectors
+      const selectors = this.postSelectors || [
+        '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])'
       ];
 
       // Sử dụng Set để lưu trữ các phần tử duy nhất dựa trên ID
@@ -881,7 +875,7 @@ class FacebookScraper {
   }
 
   /**
-   * Finish collection and return results
+   * Finish collection and save results
    */
   finishCollection() {
     if (!this.isCollecting) return;
@@ -899,6 +893,9 @@ class FacebookScraper {
 
     clearInterval(this.cleanupInterval);
 
+    // Remove duplicate posts
+    this.removeDuplicatePosts();
+
     // Prepare result
     const result = {
       group: this.groupInfo,
@@ -908,10 +905,12 @@ class FacebookScraper {
       lastSaved: new Date().toISOString()
     };
 
-    // Save both to localStorage entries - one for state management, one for data retrieval
+    // Save to multiple localStorage entries for redundancy
     try {
+      // Save to both keys for compatibility and redundancy
       localStorage.setItem('fb-scraper-last-result', JSON.stringify(result));
       localStorage.setItem('fb-scraper-progress-data', JSON.stringify(result));
+      localStorage.setItem('fb-scraper-result', JSON.stringify(result));
       this.log('Results saved to localStorage for backup');
     } catch (e) {
       this.log('Error saving to localStorage:', e.message);
@@ -934,6 +933,12 @@ class FacebookScraper {
           }
         }
       );
+
+      // Also send with legacy action name for backward compatibility
+      chrome.runtime.sendMessage({
+        action: 'scraperResult',
+        result: result
+      });
     } catch (e) {
       this.log('Error sending completion message:', e.message);
       // Fallback: Create a download link directly in the page
@@ -941,50 +946,6 @@ class FacebookScraper {
     }
 
     return result;
-  }
-
-  /**
-   * Finish collection and save results
-   */
-  finishCollection() {
-    this.isCollecting = false;
-    if (this.observer) {
-      this.observer.disconnect();
-    }
-
-    // Thêm dòng này để loại bỏ các bài trùng lặp
-    this.removeDuplicatePosts();
-
-    this.log(`Finishing collection with ${this.scrapedPosts.length} posts`);
-
-    // Create the final result object
-    const result = {
-      group: this.groupInfo,
-      posts: this.scrapedPosts,
-      totalScraped: this.scrapedPosts.length,
-      isComplete: true,
-      lastSaved: new Date().toISOString()
-    };
-
-    // Save to local storage as backup
-    try {
-      localStorage.setItem('fb-scraper-result', JSON.stringify(result));
-      this.log('Results saved to localStorage for backup');
-    } catch (e) {
-      console.error('Failed to save to localStorage:', e);
-    }
-
-    // Send result back to extension
-    try {
-      chrome.runtime.sendMessage({
-        action: 'scraperResult',
-        result: result
-      });
-    } catch (e) {
-      console.error('Error in messaging:', e);
-      // Provide fallback download method in case extension communication fails
-      this.createDownloadLink(result);
-    }
   }
 
   /**
@@ -1098,6 +1059,10 @@ class FacebookScraper {
 
     // Set up observer for efficient scrolling
     this.setupIntersectionObserver();
+
+    // Detect and adapt to group layout
+    this.postSelectors = this.detectGroupLayout();
+    console.log('Using post selectors:', this.postSelectors);
 
     // Get initial posts
     this.getPosts();
@@ -1476,6 +1441,13 @@ class FacebookScraper {
       'div.xsdox4t[tabindex="0"]'
     ];
 
+    // Track if we're in a modal view
+    let inModalView = false;
+    const initialURL = window.location.href;
+
+    // Store document body height to detect modal opening
+    const initialHeight = document.body.scrollHeight;
+
     // Try multiple passes as new buttons may appear after expanding others
     for (let pass = 0; pass < 3; pass++) {
       let expanded = false;
@@ -1495,8 +1467,42 @@ class FacebookScraper {
               console.log('Clicking "See more" button:', text);
               button.click();
               expanded = true;
-              // Pause briefly to let content expand
-              await new Promise((resolve) => setTimeout(resolve, 300));
+
+              // Pause to let content expand or modal open
+              await new Promise((resolve) => setTimeout(resolve, 500));
+
+              // Detect if a modal view appeared
+              const newHeight = document.body.scrollHeight;
+              const urlChanged = window.location.href !== initialURL;
+
+              if (urlChanged || Math.abs(newHeight - initialHeight) > 500) {
+                console.log('Detected modal/teleport view opening');
+                inModalView = true;
+
+                // Extract content from the modal
+                await this.extractFromModalView();
+
+                // Close the modal by pressing Escape key
+                try {
+                  document.dispatchEvent(
+                    new KeyboardEvent('keydown', {
+                      key: 'Escape',
+                      code: 'Escape',
+                      keyCode: 27,
+                      which: 27,
+                      bubbles: true
+                    })
+                  );
+
+                  // Wait for modal to close
+                  await new Promise((resolve) => setTimeout(resolve, 500));
+
+                  // Reset to initial state
+                  inModalView = false;
+                } catch (e) {
+                  console.error('Error closing modal view:', e);
+                }
+              }
             } catch (e) {
               console.debug('Error clicking see more button:', e);
             }
@@ -1508,6 +1514,83 @@ class FacebookScraper {
 
       // Wait a bit longer between passes
       await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  /**
+   * Extract content from a modal/teleport view
+   */
+  async extractFromModalView() {
+    try {
+      console.log('Extracting content from modal view');
+
+      // Modal content is usually in a different DOM structure
+      const modalSelectors = [
+        '[role="dialog"]',
+        '.x1ey2m1c', // Common Facebook modal container
+        'div[aria-modal="true"]',
+        '.x9f619.x1n2onr6.x1ja2u2z' // Another FB modal class pattern
+      ];
+
+      let modalElement = null;
+
+      // Find the modal container
+      for (const selector of modalSelectors) {
+        const element = document.querySelector(selector);
+        if (element) {
+          modalElement = element;
+          break;
+        }
+      }
+
+      if (!modalElement) {
+        console.log('Could not find modal element');
+        return null;
+      }
+
+      // Extract post content from modal using our existing methods
+      const postElement =
+        modalElement.querySelector('[role="article"]') || modalElement;
+
+      if (postElement) {
+        // Use our standard extraction methods on this modal content
+        const postContent = await this.extractAllContent(postElement);
+        const postId = this.extractPostId(postElement);
+
+        if (postContent && postId) {
+          // Store this content with its ID so we don't extract it again
+          this.processedIds.add(postId);
+
+          // Create a post object for this modal content
+          const post = {
+            postId,
+            content: postContent,
+            author: this.extractAuthor(postElement) || {
+              name: 'Unknown',
+              id: null,
+              profileUrl: null
+            },
+            timestamp:
+              this.extractTimestamp(postElement) || new Date().toISOString(),
+            images: this.extractImages(postElement) || [],
+            likes: this.extractLikes(postElement) || 0,
+            comments: (await this.extractComments(postElement)) || [],
+            extraction_success: !!postContent,
+            from_modal: true // Mark that this came from a modal view
+          };
+
+          // Add to our scraped posts
+          this.scrapedPosts.push(post);
+
+          console.log('Successfully extracted post from modal view:', postId);
+          return post;
+        }
+      }
+
+      return null;
+    } catch (e) {
+      console.error('Error extracting from modal view:', e);
+      return null;
     }
   }
 
@@ -1942,6 +2025,64 @@ class FacebookScraper {
     });
 
     this.log(`Sau khi loại bỏ trùng lặp: ${this.scrapedPosts.length} bài viết`);
+  }
+
+  /**
+   * Detect and adapt to different Facebook group layouts
+   */
+  detectGroupLayout() {
+    try {
+      // Check various elements to determine the layout type
+      const hasNewDesign = !!document.querySelector('.x9f619.x1n2onr6');
+      const hasLegacyDesign = !!document.querySelector(
+        '[data-pagelet="GroupFeed"]'
+      );
+      const hasClassicFeed = !!document.querySelector('[role="feed"]');
+
+      console.log('Group layout detection:', {
+        hasNewDesign,
+        hasLegacyDesign,
+        hasClassicFeed
+      });
+
+      // Update selectors based on detected layout
+      if (hasNewDesign) {
+        // Use modern selectors optimized for new layout
+        this.postSelectors = [
+          '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])',
+          'div.x1yztbdb:not([aria-label*="Comment"]):has(div[data-ad-comet-preview="message"])',
+          'div.x1lliihq:has(div[data-ad-comet-preview="message"])',
+          // Additional modern selectors
+          'div.x78zum5:not([aria-label*="Comment"])',
+          'div.x1lq5wgf:has(div.xdj266r)'
+        ];
+      } else if (hasLegacyDesign) {
+        // Use selectors optimized for legacy design
+        this.postSelectors = [
+          '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])',
+          'div.sjgh65i0',
+          'div.du4w35lb:has(div.f530mmz5)',
+          'div.lzcic4wl:has(div.kvgmc6g5)'
+        ];
+      } else {
+        // Fallback selectors that work across most layouts
+        this.postSelectors = [
+          '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])',
+          'div[data-ad-comet-preview="message"]',
+          'div.story_body_container',
+          'div.userContentWrapper'
+        ];
+      }
+
+      // Update getPosts method to use the new selectors
+      return this.postSelectors;
+    } catch (e) {
+      console.error('Error detecting group layout:', e);
+      // Return default selectors as fallback
+      return [
+        '[role="article"]:not([aria-label*="Comment"]):not([aria-label*="Bình luận"])'
+      ];
+    }
   }
 }
 
